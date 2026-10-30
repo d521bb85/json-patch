@@ -1,0 +1,8 @@
+.zig-cache/
+zig-out/
+bench/data/
+bench/compare/rust/target/
+bench/compare/rust/Cargo.lock
+bench/compare/go/go.sum
+bench/compare/node/node_modules/
+bench/compare/node/package-lock.json

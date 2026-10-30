@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        optimize: [Debug, ReleaseSafe, ReleaseFast]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - run: zig build test --summary all -Doptimize=${{ matrix.optimize }}
+
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.0
+      - run: zig fmt --check build.zig build.zig.zon src test bench
+      - run: zig build docs
+      - name: Compile for other targets
+        run: |
+          for target in x86_64-linux-musl aarch64-linux-musl riscv64-linux-musl powerpc64-linux-musl wasm32-wasi; do
+            zig build -Dtarget=$target
+          done
