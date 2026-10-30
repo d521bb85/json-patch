@@ -17,7 +17,7 @@ skipped by a bit-parallel scanner and copied to the output untouched.
 Requires Zig 0.17.0.
 
 ```bash
-zig fetch --save git+https://github.com/OWNER/json-patch
+zig fetch --save git+https://github.com/d521bb85/json-patch
 ```
 
 Then, in `build.zig`:
