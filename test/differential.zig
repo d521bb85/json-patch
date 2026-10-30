@@ -377,7 +377,15 @@ fn expectMatches(a: Allocator, doc: *const Document, model: *const Model) !void 
     }
 }
 
-fn runRound(seed: u64, patches: usize) !void {
+/// How a round parses its document. A large document gets an index, which
+/// changes how containers are expanded, and how that happens depends on whether
+/// the document was validated.
+const Mode = struct {
+    large: bool = false,
+    validation: @FieldType(Document.ParseOptions, "validation") = .full,
+};
+
+fn runRound(seed: u64, patches: usize, mode: Mode) !void {
     var prng: std.Random.DefaultPrng = .init(seed);
     const random = prng.random();
 
@@ -387,14 +395,24 @@ fn runRound(seed: u64, patches: usize) !void {
     const a = arena.allocator();
     var g: Generator = .{ .a = a, .random = random };
 
-    const initial = while (true) {
+    var initial = while (true) {
         const value = try g.value(4);
         if (value == .object or value == .array) break value;
     };
     var text: std.Io.Writer.Allocating = .init(a);
     try g.write(&text.writer, initial);
+    while (mode.large and text.written().len < 4096) {
+        const value = try g.value(4);
+        switch (initial) {
+            .array => |*array| try array.append(value),
+            .object => |*object| try object.put(a, try std.fmt.allocPrint(a, "m{d}", .{object.count()}), value),
+            else => unreachable,
+        }
+        text.clearRetainingCapacity();
+        try g.write(&text.writer, initial);
+    }
 
-    var doc: Document = try .parse(gpa, text.written(), .{});
+    var doc: Document = try .parse(gpa, text.written(), .{ .validation = mode.validation });
     defer doc.deinit();
     var model: Model = .{ .arena = a, .root = initial };
 
@@ -467,20 +485,87 @@ fn runRound(seed: u64, patches: usize) !void {
 test "random patches agree with the reference model" {
     var seed: u64 = 1;
     while (seed <= 3000) : (seed += 1) {
-        runRound(seed, 12) catch |err| {
+        runRound(seed, 12, .{}) catch |err| {
             std.debug.print("\nfailing seed: {d}\n", .{seed});
             return err;
         };
     }
 }
 
+test "random patches agree with the reference model on large documents" {
+    var seed: u64 = 2_000_000;
+    while (seed < 2_000_400) : (seed += 1) {
+        for ([_]Mode{ .{ .large = true }, .{ .large = true, .validation = .none } }) |mode| {
+            runRound(seed, 12, mode) catch |err| {
+                std.debug.print("\nfailing seed: {d}, validation: {t}\n", .{ seed, mode.validation });
+                return err;
+            };
+        }
+    }
+}
+
 test "a document survives a long stream of patches" {
     var seed: u64 = 1_000_000;
     while (seed < 1_000_020) : (seed += 1) {
-        runRound(seed, 300) catch |err| {
+        runRound(seed, 300, .{}) catch |err| {
             std.debug.print("\nfailing seed: {d}\n", .{seed});
             return err;
         };
+    }
+}
+
+test "a corrupted large document that skipped validation fails safely" {
+    var prng: std.Random.DefaultPrng = .init(0x6904);
+    const random = prng.random();
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var g: Generator = .{ .a = a, .random = random };
+
+    var text: std.Io.Writer.Allocating = .init(gpa);
+    defer text.deinit();
+    const bytes = "\"\\{}[]:,0123456789-.etrufalsn \n\x00\xff";
+
+    for (0..300) |_| {
+        var root: std.json.ObjectMap = .empty;
+        text.clearRetainingCapacity();
+        while (text.written().len < 4096) {
+            try root.put(a, try std.fmt.allocPrint(a, "m{d}", .{root.count()}), try g.value(4));
+            text.clearRetainingCapacity();
+            try g.write(&text.writer, .{ .object = root });
+        }
+
+        var patch: Patch = .init(gpa);
+        defer patch.deinit();
+        for (0..4) |i| {
+            var name: [16]u8 = undefined;
+            const path = try std.fmt.bufPrint(&name, "/m{d}", .{i});
+            try patch.testValue(path, Patch.Raw{ .json = "[1,{\"a\":2}]" });
+        }
+        for (0..4) |i| {
+            var name: [16]u8 = undefined;
+            const path = try std.fmt.bufPrint(&name, "/m{d}/0", .{i});
+            try patch.add(path, 1);
+        }
+
+        for (0..20) |_| {
+            const corrupted = try gpa.dupe(u8, text.written());
+            defer gpa.free(corrupted);
+            for (0..random.intRangeAtMost(u8, 1, 8)) |_| {
+                corrupted[random.uintLessThan(usize, corrupted.len)] = bytes[random.uintLessThan(usize, bytes.len)];
+            }
+            var doc = Document.parse(gpa, corrupted, .{ .validation = .none }) catch continue;
+            defer doc.deinit();
+            // Each operation on its own, so that the first failure stops nothing.
+            for (patch.operations.items) |operation| {
+                var single: Patch = .init(gpa);
+                defer single.deinit();
+                try single.operations.append(single.arena.allocator(), operation);
+                doc.apply(&single, .{}) catch {};
+            }
+            const output = doc.toOwnedSlice(gpa) catch continue;
+            gpa.free(output);
+        }
     }
 }
 

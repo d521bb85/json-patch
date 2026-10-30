@@ -32,5 +32,5 @@ jobs:
       - name: Compile for other targets
         run: |
           for target in x86_64-linux-musl aarch64-linux-musl riscv64-linux-musl powerpc64-linux-musl wasm32-wasi; do
-            zig build -Dtarget=$target
+            zig test src/root.zig -target $target --test-no-exec -femit-bin=/tmp/test-$target
           done

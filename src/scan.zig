@@ -14,22 +14,51 @@ const assert = std.debug.assert;
 /// Width of the vectors used to search within strings.
 const chunk_len = @min(std.simd.suggestVectorLength(u8) orelse 16, 32);
 const Chunk = @Vector(chunk_len, u8);
-const Block = @Vector(64, u8);
+pub const Block = @Vector(64, u8);
+
+/// Returns whether two strings of the same length are equal. Comparing the first
+/// and last bytes of a short string as integers, overlapping in the middle, needs
+/// neither a loop nor a call.
+pub inline fn eql(a: []const u8, b: []const u8) bool {
+    const len = a.len;
+    if (len >= 8) {
+        if (len > 16) return std.mem.eql(u8, a, b);
+        return load(u64, a, 0) == load(u64, b, 0) and load(u64, a, len - 8) == load(u64, b, len - 8);
+    }
+    if (len >= 4) return load(u32, a, 0) == load(u32, b, 0) and load(u32, a, len - 4) == load(u32, b, len - 4);
+    if (len == 0) return true;
+    return a[0] == b[0] and a[len / 2] == b[len / 2] and a[len - 1] == b[len - 1];
+}
+
+inline fn load(comptime T: type, bytes: []const u8, at: usize) T {
+    return std.mem.readInt(T, bytes[at..][0..@sizeOf(T)], .little);
+}
 
 /// Returns the offset of the first `true` element of `mask`.
 pub inline fn firstSet(mask: @Vector(chunk_len, bool)) ?usize {
-    if (comptime builtin.cpu.arch == .aarch64 and chunk_len == 16) {
-        // NEON has no movemask. Narrowing each 16-bit lane by 4 bits packs a
-        // nibble per byte into 64 bits, which is a single `shrn` instruction.
+    const bits = chunkBits(mask);
+    return if (bits == 0) null else @ctz(bits) / chunk_bits;
+}
+
+/// How many bits `chunkBits` uses for each byte.
+pub const chunk_bits = if (builtin.cpu.arch == .aarch64 and chunk_len == 16) 4 else 1;
+
+/// Packs a mask of a chunk into an integer in which the lowest set bit stands
+/// for the first `true` element. NEON cannot spare a bit for each byte, but it
+/// can narrow each 16-bit lane by 4 bits with a single `shrn` instruction.
+pub inline fn chunkBits(mask: @Vector(chunk_len, bool)) u64 {
+    if (comptime chunk_bits == 4) {
         const bytes: @Vector(16, u8) = @select(u8, mask, @as(Chunk, @splat(0xff)), @as(Chunk, @splat(0)));
         const wide: @Vector(8, u16) = @bitCast(bytes);
         const narrow: @Vector(8, u8) = @truncate(wide >> @splat(4));
-        const nibbles: u64 = @bitCast(narrow);
-        return if (nibbles == 0) null else @ctz(nibbles) >> 2;
+        return @bitCast(narrow);
     }
     const bits: @Int(.unsigned, chunk_len) = @bitCast(mask);
-    if (bits == 0) return null;
-    return if (builtin.cpu.arch.endian() == .little) @ctz(bits) else @clz(bits);
+    return if (builtin.cpu.arch.endian() == .little) bits else @bitReverse(bits);
+}
+
+inline fn stopBits(chunk: Chunk) u64 {
+    return chunkBits((chunk == @as(Chunk, @splat('"'))) | (chunk == @as(Chunk, @splat('\\'))));
 }
 
 pub inline fn loadChunk(src: []const u8, at: usize) Chunk {
@@ -48,7 +77,7 @@ pub inline fn isWhitespace(c: u8) bool {
 
 pub inline fn skipWhitespace(src: []const u8, start: usize) usize {
     var i = start;
-    while (i < src.len and isWhitespace(src[i])) i += 1;
+    while (i < src.len and src[i] <= ' ' and isWhitespace(src[i])) i += 1;
     return i;
 }
 
@@ -63,6 +92,16 @@ pub const StringEnd = struct {
 pub inline fn stringEnd(src: []const u8, start: usize) ?StringEnd {
     var i = start;
     var escaped = false;
+    // Most strings end within two chunks, and they often end close to the border
+    // between them. Considering both at once makes that impossible to mispredict.
+    if (src.len -| i >= 2 * chunk_len) {
+        const first = stopBits(loadChunk(src, i));
+        const second = stopBits(loadChunk(src, i + chunk_len));
+        if (first | second != 0) {
+            const offset = if (first != 0) @ctz(first) / chunk_bits else chunk_len + @ctz(second) / chunk_bits;
+            if (src[i + offset] == '"') return .{ .end = i + offset, .escaped = false };
+        }
+    }
     while (src.len - i >= chunk_len) {
         const chunk = loadChunk(src, i);
         const stop = (chunk == @as(Chunk, @splat('"'))) | (chunk == @as(Chunk, @splat('\\')));
@@ -99,17 +138,31 @@ pub inline fn valueEnd(src: []const u8, start: usize) ?usize {
             return string.end + 1;
         },
         '{', '[' => return containerEnd(src, start),
-        else => {
-            var i = start + 1;
-            while (i < src.len) : (i += 1) {
-                switch (src[i]) {
-                    ',', ']', '}', ' ', '\n', '\r', '\t' => break,
-                    else => {},
-                }
-            }
-            return i;
-        },
+        else => return scalarEnd(src, start),
     }
+}
+
+/// Returns the index just past the number or literal at `start`.
+inline fn scalarEnd(src: []const u8, start: usize) usize {
+    if (src.len - start >= chunk_len) {
+        const chunk = loadChunk(src, start);
+        // Every byte that can end a scalar is at most a space, or it is a comma
+        // or a closing bracket. The latter two differ only in bit 5.
+        const closers = chunk | @as(Chunk, @splat(0x20));
+        const stop = chunkBits((chunk <= @as(Chunk, @splat(' '))) | (chunk == @as(Chunk, @splat(','))) |
+            (closers == @as(Chunk, @splat('}'))));
+        // A value is never empty, even in text that is not valid.
+        const after_first = stop & (@as(u64, std.math.maxInt(u64)) << chunk_bits);
+        if (after_first != 0) return start + @ctz(after_first) / chunk_bits;
+    }
+    var i = start + 1;
+    while (i < src.len) : (i += 1) {
+        switch (src[i]) {
+            ',', ']', '}', ' ', '\n', '\r', '\t' => break,
+            else => {},
+        }
+    }
+    return i;
 }
 
 /// Returns the index just past the container that opens at `start`.
@@ -140,9 +193,8 @@ const BlockState = struct {
     /// Returns the offset just past the bracket that closes the container, if
     /// it is in `block`.
     inline fn scan(state: *BlockState, block: Block) ?usize {
-        const quotes = maskOf(block, '"') & ~state.escapedBytes(maskOf(block, '\\'));
-        const strings = prefixXor(quotes) ^ state.in_string;
-        state.in_string = @bitCast(@as(i64, @bitCast(strings)) >> 63);
+        const quotes = maskOf(block, '"') & ~escapedBytes(&state.escape_carry, maskOf(block, '\\'));
+        const strings = stringBytes(&state.in_string, quotes);
 
         // '[' and ']' differ from '{' and '}' only in bit 5.
         const folded = block | @as(Block, @splat(0x20));
@@ -163,43 +215,71 @@ const BlockState = struct {
         state.depth += @popCount(opens);
         return null;
     }
-
-    /// Returns a mask of the bytes that are escaped by the preceding backslash.
-    inline fn escapedBytes(state: *BlockState, all_backslashes: u64) u64 {
-        if (all_backslashes == 0) {
-            defer state.escape_carry = 0;
-            return state.escape_carry;
-        }
-        const even: u64 = 0x5555_5555_5555_5555;
-        const backslashes = all_backslashes & ~state.escape_carry;
-        const follows = (backslashes << 1) | state.escape_carry;
-        const odd_starts = backslashes & ~even & ~follows;
-        const sum, const overflow = @addWithOverflow(odd_starts, backslashes);
-        state.escape_carry = overflow;
-        return (even ^ (sum << 1)) & follows;
-    }
 };
 
-inline fn maskOf(block: Block, byte: u8) u64 {
-    const matches = block == @as(Block, @splat(byte));
-    if (comptime builtin.cpu.arch == .aarch64) return gatherBits(matches);
-    const bits: u64 = @bitCast(matches);
+/// Returns a mask of the bytes that are escaped by the preceding backslash.
+/// `carry` is 1 if the previous block ended with an unescaped backslash.
+pub inline fn escapedBytes(carry: *u64, all_backslashes: u64) u64 {
+    if (all_backslashes == 0) {
+        defer carry.* = 0;
+        return carry.*;
+    }
+    const even: u64 = 0x5555_5555_5555_5555;
+    const backslashes = all_backslashes & ~carry.*;
+    const follows = (backslashes << 1) | carry.*;
+    const odd_starts = backslashes & ~even & ~follows;
+    const sum, const overflow = @addWithOverflow(odd_starts, backslashes);
+    carry.* = overflow;
+    return (even ^ (sum << 1)) & follows;
+}
+
+/// Returns a mask of the bytes from each opening quote up to, but not including,
+/// its closing quote. `in_string` is all ones if the previous block ended inside
+/// a string.
+pub inline fn stringBytes(in_string: *u64, quotes: u64) u64 {
+    const strings = prefixXor(quotes) ^ in_string.*;
+    in_string.* = @bitCast(@as(i64, @bitCast(strings)) >> 63);
+    return strings;
+}
+
+pub inline fn maskOf(block: Block, byte: u8) u64 {
+    return bitsOf(block == @as(Block, @splat(byte)));
+}
+
+/// Packs a mask into an integer, with bit `i` standing for byte `i`.
+pub inline fn bitsOf(mask: @Vector(64, bool)) u64 {
+    return bitsOfBytes(bytesOf(mask));
+}
+
+/// Returns a vector with all bits of each byte set if that element of `mask` is.
+/// Logic on these is much faster than on vectors of `bool`, which most compilers
+/// handle one element at a time on anything without mask registers.
+pub inline fn bytesOf(mask: @Vector(64, bool)) Block {
+    return @select(u8, mask, @as(Block, @splat(0xff)), @as(Block, @splat(0)));
+}
+
+/// As `bitsOf`, for a mask from `bytesOf`.
+pub inline fn bitsOfBytes(mask: Block) u64 {
+    if (comptime builtin.cpu.arch == .aarch64) return gatherBits(mask);
+    const bits: u64 = @bitCast(mask == @as(Block, @splat(0xff)));
     return if (builtin.cpu.arch.endian() == .little) bits else @bitReverse(bits);
 }
 
-/// Packs a mask into an integer. Compilers lower a plain bit cast on NEON by
-/// summing each lane separately, which is several times slower than merging
-/// neighboring bytes of all lanes together, as done here.
-inline fn gatherBits(mask: @Vector(64, bool)) u64 {
+/// Compilers lower a plain bit cast on NEON by summing each lane separately,
+/// which is several times slower than merging neighboring bytes of all lanes
+/// together, as done here. This is written with `addp` because compilers replace
+/// the equivalent vector arithmetic with two shuffles and an `orr`.
+inline fn gatherBits(mask: Block) u64 {
     const Lane = @Vector(16, u8);
     const weights: Lane = .{ 1, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128 };
-    const bytes = @select(u8, mask, @shuffle(u8, weights, undefined, repeat_lane), @as(Block, @splat(0)));
+    const bytes = mask & @shuffle(u8, weights, undefined, repeat_lane);
     const merge = struct {
-        const even: @Vector(16, i32) = .{ 0, 2, 4, 6, 8, 10, 12, 14, -1, -3, -5, -7, -9, -11, -13, -15 };
-        const odd: @Vector(16, i32) = .{ 1, 3, 5, 7, 9, 11, 13, 15, -2, -4, -6, -8, -10, -12, -14, -16 };
-
         inline fn pairs(a: Lane, b: Lane) Lane {
-            return @shuffle(u8, a, b, even) | @shuffle(u8, a, b, odd);
+            return asm ("addp %[out].16b, %[a].16b, %[b].16b"
+                : [out] "=w" (-> Lane),
+                : [a] "w" (a),
+                  [b] "w" (b),
+            );
         }
     };
     const lanes: [4]Lane = @bitCast(bytes);
@@ -216,7 +296,7 @@ const repeat_lane: @Vector(64, i32) = blk: {
 
 /// Each bit of the result is the parity of all lower bits of `x`, which turns a
 /// mask of quotes into a mask of string contents.
-inline fn prefixXor(x: u64) u64 {
+pub inline fn prefixXor(x: u64) u64 {
     var y = x;
     y ^= y << 1;
     y ^= y << 2;
@@ -251,6 +331,21 @@ fn naiveContainerEnd(src: []const u8, start: usize) ?usize {
         }
     }
     return null;
+}
+
+test eql {
+    var a: [64]u8 = undefined;
+    var b: [64]u8 = undefined;
+    for (&a, 0..) |*byte, i| byte.* = @truncate('a' + i % 26);
+    b = a;
+    for (0..a.len) |len| {
+        try testing.expect(eql(a[0..len], b[0..len]));
+        for (0..len) |i| {
+            b[i] ^= 1;
+            try testing.expect(!eql(a[0..len], b[0..len]));
+            b[i] ^= 1;
+        }
+    }
 }
 
 test containerEnd {
@@ -359,4 +454,14 @@ test valueEnd {
     try testing.expectEqual(2, valueEnd("-1 ", 0));
     try testing.expectEqual(3, valueEnd("\"a\"", 0));
     try testing.expectEqual(null, valueEnd("", 0));
+
+    // The same, with enough text after them to be read a chunk at a time.
+    try testing.expectEqual(4, valueEnd("true,                                ", 0));
+    try testing.expectEqual(2, valueEnd("12}                                  ", 0));
+    try testing.expectEqual(5, valueEnd("12345\n                               ", 0));
+
+    // Invalid text cannot produce an empty value.
+    try testing.expectEqual(2, valueEnd(",1]                                  ", 0));
+    try testing.expectEqual(1, valueEnd("]]                                   ", 0));
+    try testing.expectEqual(1, valueEnd(":,                                   ", 0));
 }

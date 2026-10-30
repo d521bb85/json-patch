@@ -67,7 +67,7 @@ def main():
                 continue
             actual = json.loads((data / "out" / (column + "." + name + ".json")).read_text(encoding="utf-8"))
             mark = "" if same(actual, expected) else "!WRONG"
-            cells.append("%14s" % ("%.1f%s" % (row[column] / 1000, mark)))
+            cells.append("%14s" % ("%.2f%s" % (row[column] / 1000, mark)))
         print("%-14s" % name + "".join(cells))
 
 

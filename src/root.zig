@@ -53,19 +53,23 @@ pub fn apply(
     patch: []const u8,
     options: ApplyOptions,
 ) ApplyError![]u8 {
-    var parsed_patch: Patch = try .parse(gpa, patch, .{
+    // Nothing outlives this function, so a small job needs no allocations other
+    // than for its result.
+    var patch_buffer: [2048]u8 align(16) = undefined;
+    var parsed_patch: Patch = try .parseBuffered(gpa, patch, .{
         .source = .borrow,
         .max_depth = options.max_depth,
         .diagnostics = options.diagnostics,
-    });
+    }, &patch_buffer);
     defer parsed_patch.deinit();
 
-    var doc: Document = try .parse(gpa, document, .{
+    var document_buffer: [2048]u8 align(16) = undefined;
+    var doc: Document = try .parseBuffered(gpa, document, .{
         .source = .borrow,
         .validation = options.validation,
         .max_depth = options.max_depth,
         .diagnostics = options.diagnostics,
-    });
+    }, &document_buffer);
     defer doc.deinit();
 
     try doc.apply(&parsed_patch, .{ .values = .borrow, .diagnostics = options.diagnostics });
@@ -127,8 +131,10 @@ test Document {
 
 test {
     std.testing.refAllDecls(@This());
+    _ = @import("Arena.zig");
     _ = @import("number.zig");
     _ = @import("scan.zig");
     _ = @import("string.zig");
+    _ = @import("structure.zig");
     _ = @import("validate.zig");
 }

@@ -5,8 +5,9 @@
 //! inside an object or array, only that one level is split into its children,
 //! which remain slices in turn. Anything a patch does not reach is never
 //! examined again, and is copied to the output verbatim, so formatting and
-//! number precision are preserved. Expanding a container still has to scan its
-//! text to find where each child ends, but that is far cheaper than parsing it.
+//! number precision are preserved. Parsing also records where large containers
+//! end, or the first expansion does if parsing was told not to validate, so
+//! that expanding a container does not have to scan its children to find them.
 //!
 //! Patches are atomic. Each change is recorded in an undo log, so a patch that
 //! fails partway leaves the document as it was, without having to copy the
@@ -20,10 +21,12 @@
 //! reading, because reading can expand values in place.
 
 const std = @import("std");
+const Arena = @import("Arena.zig");
 const number = @import("number.zig");
 const lib = @import("root.zig");
 const scan = @import("scan.zig");
 const string = @import("string.zig");
+const structure = @import("structure.zig");
 const validate = @import("validate.zig");
 
 const Allocator = std.mem.Allocator;
@@ -37,9 +40,16 @@ const Writer = std.Io.Writer;
 const assert = std.debug.assert;
 
 gpa: Allocator,
-arena: std.heap.ArenaAllocator,
+arena: Arena,
 root: Node,
 undo: std.ArrayList(Undo) = .empty,
+/// The text of the root when the document was parsed.
+source: []const u8,
+/// Where the containers in `source` end, once that is known.
+index: structure.Index = .{},
+/// Whether `index` should be built the first time a container is expanded,
+/// because the document was not validated.
+wants_index: bool = false,
 
 pub const ParseOptions = struct {
     /// Whether the document keeps its own copy of the source text. With
@@ -135,14 +145,20 @@ const Array = struct {
     /// never cleared by a rollback, which only costs some coalescing of output.
     dirty: bool = false,
 
-    fn parse(allocator: Allocator, text: []const u8) ApplyError!*Array {
-        const array = try allocator.create(Array);
+    fn parse(arena: *Arena, text: []const u8, listed: structure.Cursor) ApplyError!*Array {
+        const array = try arena.create(Array);
         array.* = .{ .span = text };
         var i = scan.skipWhitespace(text, 1);
         if (i < text.len and text[i] == ']') return array;
+
+        var cursor = listed;
+        const allocator = arena.allocator();
+        array.items = arena.list(Node);
+        defer arena.finishList(Node, &array.items);
         while (true) {
-            const end = scan.valueEnd(text, i) orelse return error.SyntaxError;
-            try array.items.append(allocator, .initRaw(text[i..end]));
+            const end = cursor.valueEnd(text, i) orelse return error.SyntaxError;
+            if (array.items.items.len == array.items.capacity) try array.items.ensureUnusedCapacity(allocator, 1);
+            array.items.appendAssumeCapacity(.initRaw(text[i..end]));
             i = scan.skipWhitespace(text, end);
             if (i >= text.len) return error.SyntaxError;
             switch (text[i]) {
@@ -171,22 +187,28 @@ const Object = struct {
     /// Objects smaller than this are always searched linearly.
     const min_indexed_len = 32;
 
-    fn parse(allocator: Allocator, text: []const u8) ApplyError!*Object {
-        const object = try allocator.create(Object);
+    fn parse(arena: *Arena, text: []const u8, listed: structure.Cursor) ApplyError!*Object {
+        const object = try arena.create(Object);
         object.* = .{ .span = text };
         var i = scan.skipWhitespace(text, 1);
         if (i < text.len and text[i] == '}') return object;
+
+        var cursor = listed;
+        const allocator = arena.allocator();
+        object.members = arena.list(Member);
+        defer arena.finishList(Member, &object.members);
         while (true) {
             if (i >= text.len or text[i] != '"') return error.SyntaxError;
             const key_start = i + 1;
-            const key = scan.stringEnd(text, key_start) orelse return error.SyntaxError;
+            const key = scan.stringEnd(cursor.widen(text), key_start) orelse return error.SyntaxError;
             i = scan.skipWhitespace(text, key.end + 1);
             if (i >= text.len or text[i] != ':') return error.SyntaxError;
             i = scan.skipWhitespace(text, i + 1);
-            const end = scan.valueEnd(text, i) orelse return error.SyntaxError;
-            try object.members.append(allocator, .{
+            const end = cursor.valueEnd(text, i) orelse return error.SyntaxError;
+            if (object.members.items.len == object.members.capacity) try object.members.ensureUnusedCapacity(allocator, 1);
+            object.members.appendAssumeCapacity(.{
                 .key_ptr = text[key_start..].ptr,
-                .key = .{ .len = @intCast(key.end - key_start), .escaped = key.escaped, .removed = false },
+                .key = .init(text[key_start..key.end], key.escaped),
                 .value = .initRaw(text[i..end]),
             });
             i = scan.skipWhitespace(text, end);
@@ -206,28 +228,30 @@ const Object = struct {
         if (object.slots.len == 0 and members.len >= min_indexed_len and
             members.len <= std.math.maxInt(u32) - 1)
         {
-            // Building the table costs about as much as a few linear searches,
-            // so it is only worth it once the object has been searched a few.
+            // Building the table costs as much as a good number of linear
+            // searches, so it is only worth it once that many have happened.
             object.visited += members.len;
-            if (object.visited >= 4 * members.len) try object.buildIndex(allocator);
+            if (object.visited >= 32 * members.len) try object.buildIndex(allocator);
         }
         if (object.slots.len != 0) return object.probe(key);
 
+        const word = Member.Key.wordFor(key);
         var i = members.len;
         while (i > 0) {
             i -= 1;
-            if (members[i].matches(key)) return i;
+            if (members[i].matches(key, word)) return i;
         }
         return null;
     }
 
     fn probe(object: *Object, key: []const u8) ?usize {
+        const word = Member.Key.wordFor(key);
         const mask = object.slots.len - 1;
         var slot = hash(object, key) & mask;
         while (true) : (slot = (slot + 1) & mask) {
             const entry = object.slots[slot];
             if (entry == 0) return null;
-            if (object.members.items[entry - 1].matches(key)) return entry - 1;
+            if (object.members.items[entry - 1].matches(key, word)) return entry - 1;
         }
     }
 
@@ -257,13 +281,14 @@ const Object = struct {
         else
             member.name();
 
+        const word = Member.Key.wordFor(key);
         const mask = object.slots.len - 1;
         var slot = hash(object, key) & mask;
         while (true) : (slot = (slot + 1) & mask) {
             const entry = object.slots[slot];
             if (entry == 0) break;
             const other = &members[entry - 1];
-            if (other.matches(key)) {
+            if (other.matches(key, word)) {
                 other.key.removed = true;
                 break;
             }
@@ -283,7 +308,7 @@ const Object = struct {
         };
         try object.members.append(allocator, .{
             .key_ptr = quoted[1..].ptr,
-            .key = .{ .len = @intCast(quoted.len - 2), .escaped = escaped, .removed = false },
+            .key = .init(quoted[1 .. quoted.len - 1], escaped),
             .value = value,
         });
         if (object.slots.len == 0) return;
@@ -299,12 +324,44 @@ const Member = struct {
     /// The key as it appears in JSON, escapes included. The bytes on either
     /// side of it are always its quotes.
     key_ptr: [*]const u8,
-    key: packed struct(usize) {
-        len: @Int(.unsigned, @bitSizeOf(usize) - 2),
+    key: Key,
+    value: Node,
+
+    const Key = packed struct(usize) {
+        len: @Int(.unsigned, @bitSizeOf(usize) - @bitSizeOf(Fingerprint) - 2),
+        /// A hash of the text of the key. Searching members compares this word,
+        /// which saves reading the text of nearly all of them, and the text is
+        /// spread throughout the document, unlike the members.
+        fingerprint: Fingerprint,
         escaped: bool,
         removed: bool,
-    },
-    value: Node,
+
+        /// Only keys that are larger than a terabyte are beyond what this can
+        /// represent on 64-bit targets. There is no room for this on smaller ones.
+        const Fingerprint = if (@bitSizeOf(usize) == 64) u22 else u0;
+
+        inline fn init(text: []const u8, escaped: bool) Key {
+            return .{ .len = @intCast(text.len), .fingerprint = fingerprintOf(text), .escaped = escaped, .removed = false };
+        }
+
+        /// Returns what `key` of a member is if its text is exactly `text`.
+        inline fn wordFor(text: []const u8) usize {
+            return @bitCast(init(text, false));
+        }
+
+        inline fn fingerprintOf(text: []const u8) Fingerprint {
+            if (Fingerprint == u0) return 0;
+            const len = text.len;
+            const bytes: u64 = if (len >= 4)
+                @as(u64, std.mem.readInt(u32, text[0..4], .little)) << 32 |
+                    std.mem.readInt(u32, text[len - 4 ..][0..4], .little)
+            else if (len != 0)
+                @as(u64, text[0]) << 16 | @as(u64, text[len / 2]) << 8 | text[len - 1]
+            else
+                0;
+            return @truncate((bytes *% 0x9e37_79b9_7f4a_7c15) >> 42);
+        }
+    };
 
     inline fn name(member: *const Member) []const u8 {
         return member.key_ptr[0..member.key.len];
@@ -315,9 +372,12 @@ const Member = struct {
         return (member.key_ptr - 1)[0 .. @as(usize, member.key.len) + 2];
     }
 
-    inline fn matches(member: *const Member, key: []const u8) bool {
-        // Comparing the whole word checks the length and both flags at once.
-        if (@as(usize, @bitCast(member.key)) == key.len) return std.mem.eql(u8, member.name(), key);
+    /// Returns whether this member is called `key`, for which `word` is the
+    /// result of `Key.wordFor`.
+    inline fn matches(member: *const Member, key: []const u8, word: usize) bool {
+        // Comparing the whole word checks the length, the fingerprint, and both
+        // flags at once.
+        if (@as(usize, @bitCast(member.key)) == word) return scan.eql(member.name(), key);
         return member.key.escaped and !member.key.removed and string.eqlDecoded(member.name(), key);
     }
 };
@@ -336,8 +396,27 @@ const Undo = union(enum) {
 /// Parses a document. On failure, `options.diagnostics` receives the offset of
 /// the problem.
 pub fn parse(gpa: Allocator, source: []const u8, options: ParseOptions) ParseError!Document {
+    return parseInto(.init(gpa), source, options);
+}
+
+/// As `parse`, starting out with `buffer` instead of allocating, which is what
+/// `lib.apply` uses, as it knows the document does not outlive it.
+pub fn parseBuffered(gpa: Allocator, source: []const u8, options: ParseOptions, buffer: []u8) ParseError!Document {
+    return parseInto(.initBuffer(gpa, buffer), source, options);
+}
+
+inline fn parseInto(empty: Arena, source: []const u8, options: ParseOptions) ParseError!Document {
+    var arena = empty;
+    errdefer arena.deinit();
+    const gpa = arena.gpa;
+
+    // A rough guess at what the index and the expanded containers will need, which
+    // saves growing a very large one through a series of ever larger chunks.
+    try arena.reserve(std.math.clamp(source.len / 16, 1024, 16 << 20));
+
+    var index: structure.Index = .{};
     const text = switch (options.validation) {
-        .full => text: {
+        .full => try structure.document(arena.allocator(), source, options.max_depth, &index) orelse text: {
             var cursor: validate.Cursor = .{ .src = source };
             break :text cursor.document(options.max_depth) catch |err| {
                 if (options.diagnostics) |diagnostics| diagnostics.* = .{ .offset = cursor.pos };
@@ -350,17 +429,25 @@ pub fn parse(gpa: Allocator, source: []const u8, options: ParseOptions) ParseErr
             break :text trimmed;
         },
     };
-    var doc: Document = .{ .gpa = gpa, .arena = .init(gpa), .root = undefined };
-    errdefer doc.arena.deinit();
-    doc.root = .initRaw(switch (options.source) {
-        .copy => try doc.arena.allocator().dupe(u8, text),
+    const owned = switch (options.source) {
+        .copy => try arena.allocator().dupe(u8, text),
         .borrow => text,
-    });
-    return doc;
+    };
+    return .{
+        .gpa = gpa,
+        .arena = arena,
+        .root = .initRaw(owned),
+        .source = owned,
+        .index = index,
+        .wants_index = options.validation == .none and wantsIndex(owned),
+    };
+}
+
+fn wantsIndex(text: []const u8) bool {
+    return structure.Index.suits(text.len) and text[0] | 0x20 == '{';
 }
 
 pub fn deinit(doc: *Document) void {
-    doc.undo.deinit(doc.gpa);
     doc.arena.deinit();
     doc.* = undefined;
 }
@@ -369,10 +456,12 @@ pub fn deinit(doc: *Document) void {
 /// document is left as it was, `options.diagnostics` receives the index of the
 /// failed operation, and its error is returned.
 pub fn apply(doc: *Document, patch: *const Patch, options: ApplyOptions) ApplyError!void {
-    var scratch: std.heap.ArenaAllocator = .init(doc.gpa);
+    var scratch: Arena = .init(doc.gpa);
     defer scratch.deinit();
 
     doc.undo.clearRetainingCapacity();
+    // Most operations need one entry, and any that need more will still grow it.
+    try doc.undo.ensureTotalCapacity(doc.arena.allocator(), patch.operations.items.len);
     for (patch.operations.items, 0..) |operation, i| {
         doc.step(operation, options.values, &scratch) catch |err| {
             doc.rollback();
@@ -391,7 +480,7 @@ fn step(
     doc: *Document,
     operation: Operation,
     values: lib.Ownership,
-    scratch: *std.heap.ArenaAllocator,
+    scratch: *Arena,
 ) ApplyError!void {
     switch (operation) {
         .add => |o| try doc.insert(o.path, try doc.ownValue(o.value, values)),
@@ -399,7 +488,7 @@ fn step(
         .replace => |o| {
             const value = try doc.ownValue(o.value, values);
             const location = try doc.locate(o.path.tokens, .write);
-            try doc.undo.ensureUnusedCapacity(doc.gpa, 1);
+            try doc.undo.ensureUnusedCapacity(doc.arena.allocator(), 1);
             doc.undo.appendAssumeCapacity(location.undo());
             location.ptr.* = value;
         },
@@ -416,11 +505,10 @@ fn step(
         },
         .@"test" => |o| {
             const target = try doc.locate(o.path.tokens, .read);
-            defer _ = scratch.reset(.retain_capacity);
-            const allocator = scratch.allocator();
-            const text = try detachedText(doc.gpa, allocator, target.ptr.*);
+            defer scratch.reset();
+            const text = try detachedText(doc.gpa, scratch.allocator(), target.ptr.*);
             if (sameTokens(text, o.value)) return;
-            if (!try eql(allocator, text, o.value)) return error.TestFailed;
+            if (!try eql(scratch, text, o.value)) return error.TestFailed;
         },
     }
 }
@@ -455,18 +543,31 @@ inline fn open(doc: *Document, node: *Node) ApplyError!Node.Unpacked {
         .absent => return error.PathNotFound,
         .raw => |text| switch (text[0]) {
             '{' => {
-                const object = try Object.parse(doc.arena.allocator(), text);
+                const object = try Object.parse(&doc.arena, text, try doc.children(text));
                 node.* = .{ .ptr = @ptrCast(object), .len = Node.object_tag };
                 return .{ .object = object };
             },
             '[' => {
-                const array = try Array.parse(doc.arena.allocator(), text);
+                const array = try Array.parse(&doc.arena, text, try doc.children(text));
                 node.* = .{ .ptr = @ptrCast(array), .len = Node.array_tag };
                 return .{ .array = array };
             },
             else => return error.PathNotFound,
         },
     }
+}
+
+/// Returns a cursor over what the index knows about the children of `text`.
+inline fn children(doc: *Document, text: []const u8) Allocator.Error!structure.Cursor {
+    if (doc.wants_index) {
+        doc.wants_index = false;
+        try doc.index.build(doc.arena.allocator(), doc.source);
+    }
+    // Values that came from a patch are outside of `source`, and this wraps
+    // around to a large offset if they are before it.
+    const offset = @intFromPtr(text.ptr) -% @intFromPtr(doc.source.ptr);
+    if (offset >= doc.source.len) return .{ .readable = text.len };
+    return doc.index.cursor(offset, doc.source.len - offset);
 }
 
 /// An existing value, and how to restore it after changing it.
@@ -506,7 +607,7 @@ fn descend(doc: *Document, tokens: []const Token, intent: Intent) ApplyError!*No
     return node;
 }
 
-fn child(doc: *Document, parent: *Node, token: Token, intent: Intent) ApplyError!Location {
+inline fn child(doc: *Document, parent: *Node, token: Token, intent: Intent) ApplyError!Location {
     switch (try doc.open(parent)) {
         .object => |object| {
             object.dirty = object.dirty or intent == .write;
@@ -537,7 +638,7 @@ fn child(doc: *Document, parent: *Node, token: Token, intent: Intent) ApplyError
 /// Performs the core of the `add` operation.
 fn insert(doc: *Document, path: Pointer, value: Node) ApplyError!void {
     const tokens = path.tokens;
-    try doc.undo.ensureUnusedCapacity(doc.gpa, 1);
+    try doc.undo.ensureUnusedCapacity(doc.arena.allocator(), 1);
     if (tokens.len == 0) {
         doc.undo.appendAssumeCapacity(.{ .root = doc.root });
         doc.root = value;
@@ -584,7 +685,7 @@ fn insert(doc: *Document, path: Pointer, value: Node) ApplyError!void {
 fn take(doc: *Document, path: Pointer) ApplyError!Node {
     const location = try doc.locate(path.tokens, .write);
     const value = location.ptr.*;
-    try doc.undo.ensureUnusedCapacity(doc.gpa, 1);
+    try doc.undo.ensureUnusedCapacity(doc.arena.allocator(), 1);
     switch (location.parent) {
         .root => {
             doc.undo.appendAssumeCapacity(.{ .root = value });
@@ -604,11 +705,12 @@ fn take(doc: *Document, path: Pointer) ApplyError!Node {
             // Without a hash table, duplicates of the key may remain, and must
             // not come back to life.
             const name = path.tokens[path.tokens.len - 1].name;
+            const word = Member.Key.wordFor(name);
             var i = p.index;
             while (i > 0) {
                 i -= 1;
-                if (!members[i].matches(name)) continue;
-                try doc.undo.ensureUnusedCapacity(doc.gpa, 1);
+                if (!members[i].matches(name, word)) continue;
+                try doc.undo.ensureUnusedCapacity(doc.arena.allocator(), 1);
                 members[i].key.removed = true;
                 doc.undo.appendAssumeCapacity(.{ .member_restore = .{ .object = object, .index = i } });
             }
@@ -634,6 +736,7 @@ fn rollback(doc: *Document) void {
 /// tokens. That makes them equal, and is by far the most common way for values
 /// to be equal, so this avoids expanding either of them.
 fn sameTokens(a: []const u8, b: []const u8) bool {
+    if (a.len == b.len and std.mem.eql(u8, a, b)) return true;
     var i: usize = 0;
     var j: usize = 0;
     while (true) {
@@ -648,7 +751,7 @@ fn sameTokens(a: []const u8, b: []const u8) bool {
         }
         const x = scan.stringEnd(a, i + 1) orelse return false;
         const y = scan.stringEnd(b, j + 1) orelse return false;
-        if (!std.mem.eql(u8, a[i + 1 .. x.end], b[j + 1 .. y.end])) return false;
+        if (x.end - i != y.end - j or !scan.eql(a[i + 1 .. x.end], b[j + 1 .. y.end])) return false;
         i = x.end + 1;
         j = y.end + 1;
     }
@@ -660,7 +763,7 @@ fn sameTokens(a: []const u8, b: []const u8) bool {
 ///
 /// Recursion is bounded by the depth of the patch value, which was limited
 /// when it was parsed, because the comparison descends both values together.
-fn eql(allocator: Allocator, a: []const u8, b: []const u8) ApplyError!bool {
+fn eql(arena: *Arena, a: []const u8, b: []const u8) ApplyError!bool {
     if (std.mem.eql(u8, a, b)) return true;
     switch (a[0]) {
         '"' => {
@@ -669,33 +772,34 @@ fn eql(allocator: Allocator, a: []const u8, b: []const u8) ApplyError!bool {
         },
         '[' => {
             if (b[0] != '[') return false;
-            const x = try Array.parse(allocator, a);
-            const y = try Array.parse(allocator, b);
+            const x = try Array.parse(arena, a, .{ .readable = a.len });
+            const y = try Array.parse(arena, b, .{ .readable = b.len });
             if (x.items.items.len != y.items.items.len) return false;
             for (x.items.items, y.items.items) |p, q| {
-                if (!try eql(allocator, p.ptr[0..p.len], q.ptr[0..q.len])) return false;
+                if (!try eql(arena, p.ptr[0..p.len], q.ptr[0..q.len])) return false;
             }
             return true;
         },
         '{' => {
             if (b[0] != '{') return false;
-            const x = try Object.parse(allocator, a);
-            const y = try Object.parse(allocator, b);
-            return eqlObjects(allocator, x, y);
+            const x = try Object.parse(arena, a, .{ .readable = a.len });
+            const y = try Object.parse(arena, b, .{ .readable = b.len });
+            return eqlObjects(arena, x, y);
         },
         '-', '0'...'9' => return (b[0] == '-' or b[0] -% '0' <= 9) and number.eql(a, b),
         else => return false,
     }
 }
 
-fn eqlObjects(allocator: Allocator, x: *Object, y: *Object) ApplyError!bool {
+fn eqlObjects(arena: *Arena, x: *Object, y: *Object) ApplyError!bool {
+    const allocator = arena.allocator();
     for (x.members.items) |*member| {
         const name = try string.decode(allocator, member.name());
         const theirs = try y.find(allocator, name) orelse return false;
         const ours = (try x.find(allocator, name)).?;
         const p = x.members.items[ours].value;
         const q = y.members.items[theirs].value;
-        if (!try eql(allocator, p.ptr[0..p.len], q.ptr[0..q.len])) return false;
+        if (!try eql(arena, p.ptr[0..p.len], q.ptr[0..q.len])) return false;
     }
     for (y.members.items) |*member| {
         const name = try string.decode(allocator, member.name());
@@ -708,7 +812,7 @@ fn eqlObjects(allocator: Allocator, x: *Object, y: *Object) ApplyError!bool {
 /// value. The result is owned by the document, and stays valid until `deinit`
 /// or `compact`.
 pub fn get(doc: *Document, pointer: []const u8) GetError!?[]const u8 {
-    var scratch: std.heap.ArenaAllocator = .init(doc.gpa);
+    var scratch: Arena = .init(doc.gpa);
     defer scratch.deinit();
     const parsed = try Pointer.parse(scratch.allocator(), pointer);
     const location = doc.locate(parsed.tokens, .read) catch |err| switch (err) {
@@ -724,13 +828,16 @@ pub fn compact(doc: *Document) Allocator.Error!void {
     const text = try doc.toOwnedSlice(doc.gpa);
     defer doc.gpa.free(text);
 
-    var arena: std.heap.ArenaAllocator = .init(doc.gpa);
+    var arena: Arena = .init(doc.gpa);
     errdefer arena.deinit();
     const copy = try arena.allocator().dupe(u8, text);
     doc.arena.deinit();
     doc.arena = arena;
     doc.root = .initRaw(copy);
-    doc.undo.clearRetainingCapacity();
+    doc.source = copy;
+    doc.undo = .empty;
+    doc.index = .{};
+    doc.wants_index = wantsIndex(copy);
 }
 
 /// Returns the document as JSON text, which the caller owns.
@@ -741,7 +848,9 @@ pub fn toOwnedSlice(doc: *const Document, gpa: Allocator) Allocator.Error![]u8 {
         .object => |object| object.span.len,
         .raw, .absent => 0,
     };
-    var out: Writer.Allocating = try .initCapacity(gpa, expected_len);
+    // A little extra saves having to move all of it because a patch added a few
+    // bytes. The rest is given back in place.
+    var out: Writer.Allocating = try .initCapacity(gpa, expected_len + expected_len / 8 + 256);
     errdefer out.deinit();
     writeNode(doc.gpa, doc.root, &out.writer) catch return error.OutOfMemory;
     return out.toOwnedSlice();
@@ -896,9 +1005,9 @@ fn expectFailure(expected: ApplyError, document: []const u8, patch: []const u8) 
 
     const text = try doc.toOwnedSlice(gpa);
     defer gpa.free(text);
-    var arena: std.heap.ArenaAllocator = .init(gpa);
+    var arena: Arena = .init(gpa);
     defer arena.deinit();
-    try testing.expect(try eql(arena.allocator(), text, document));
+    try testing.expect(try eql(&arena, text, document));
 }
 
 test "untouched text is preserved exactly" {
@@ -1266,6 +1375,34 @@ test compact {
     try testing.expectEqualStrings("true", (try doc.get("/b/c")).?);
 }
 
+test "a compacted document keeps working" {
+    const gpa = testing.allocator;
+    var text: Writer.Allocating = .init(gpa);
+    defer text.deinit();
+    try text.writer.writeAll("{\"gone\":[");
+    for (0..1000) |i| try text.writer.print("[{d}],", .{i});
+    try text.writer.writeAll("0],\"kept\":[[1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20]]}");
+
+    var doc = try parse(gpa, text.written(), .{});
+    defer doc.deinit();
+    var remove: Patch = .init(gpa);
+    defer remove.deinit();
+    try remove.remove("/gone");
+    try doc.apply(&remove, .{});
+    try doc.compact();
+
+    // Both of these were in memory that compacting freed, and an index that was
+    // left over would describe different text.
+    try testing.expectEqual(0, doc.undo.capacity);
+    try testing.expectEqual(0, doc.index.entries.capacity);
+
+    var add: Patch = .init(gpa);
+    defer add.deinit();
+    try add.add("/kept/0/-", 21);
+    try doc.apply(&add, .{});
+    try testing.expectEqualStrings("21", (try doc.get("/kept/0/20")).?);
+}
+
 test "ownership options" {
     const gpa = testing.allocator;
     const source = try gpa.dupe(u8, "  {\"a\":[1,2]}\n");
@@ -1290,9 +1427,11 @@ test "parse failures carry an offset" {
 test "invalid text that skipped validation fails safely" {
     const gpa = testing.allocator;
     const garbage = [_][]const u8{
-        "{",    "[",    "{\"a\"", "{\"a\":", "[1",   "[1 2]", "{\"a\":1", "{1:2}",
-        "{\"a", "[\"a", "\"",     "1e!",     "-",    "1e",    "tru",      "]",
+        "{",    "[",    "{\"a\"", "{\"a\":", "[1",   "[1 2]", "{\"a\":1",                                     "{1:2}",
+        "{\"a", "[\"a", "\"",     "1e!",     "-",    "1e",    "tru",                                          "]",
         "}",    ",",    ":",      "\"abc",   "1.e!", "-e-!",
+        // A value that is empty, followed by enough for a whole chunk to be read.
+         "[,1]                                        ", "{\"a\":,\"b\":1}                                ",
     };
     const patches = [_][]const u8{
         "[{\"op\":\"add\",\"path\":\"/a\",\"value\":1}]",
@@ -1300,6 +1439,8 @@ test "invalid text that skipped validation fails safely" {
         "[{\"op\":\"test\",\"path\":\"\",\"value\":1e5}]",
         "[{\"op\":\"test\",\"path\":\"\",\"value\":[1]}]",
         "[{\"op\":\"test\",\"path\":\"/0\",\"value\":1}]",
+        "[{\"op\":\"test\",\"path\":\"/0/x\",\"value\":1}]",
+        "[{\"op\":\"test\",\"path\":\"/a/x\",\"value\":1}]",
     };
     for (patches) |source| {
         var patch = try Patch.parse(gpa, source, .{});
@@ -1313,6 +1454,30 @@ test "invalid text that skipped validation fails safely" {
             };
         }
     }
+}
+
+test "a child that does not end inside its parent is an error, not a bad slice" {
+    // Whoever scans `1",{"` from the start of the array sees a string in it, and
+    // whoever steps through its elements sees a number, a comma, and an object.
+    // That object closes at the bracket after the end of the inner array.
+    const gpa = testing.allocator;
+    var doc = try parse(gpa, "[[1\",{\"],\"]\"]", .{ .validation = .none });
+    defer doc.deinit();
+    var patch = try Patch.parse(gpa, "[{\"op\":\"test\",\"path\":\"/0/0\",\"value\":1}]", .{});
+    defer patch.deinit();
+    try testing.expectError(error.SyntaxError, doc.apply(&patch, .{}));
+}
+
+test "a key that does not end inside its object is an error, not a bad slice" {
+    // Whoever scans `1",` from the start of the object sees a string in it, and
+    // whoever steps through its members sees a number, a comma, and the start of
+    // a key, which closes at the quote after the end of the object.
+    const gpa = testing.allocator;
+    var doc = try parse(gpa, "[{\"a\":1\",\":2},\"b\"]", .{ .validation = .none });
+    defer doc.deinit();
+    var patch = try Patch.parse(gpa, "[{\"op\":\"test\",\"path\":\"/0/x\",\"value\":1}]", .{});
+    defer patch.deinit();
+    try testing.expectError(error.SyntaxError, doc.apply(&patch, .{}));
 }
 
 test "text with nothing in it cannot skip validation" {

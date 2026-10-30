@@ -6,9 +6,11 @@
 //! multiple threads at once.
 
 const std = @import("std");
+const Arena = @import("Arena.zig");
 const lib = @import("root.zig");
 const scan = @import("scan.zig");
 const string = @import("string.zig");
+const structure = @import("structure.zig");
 const validate = @import("validate.zig");
 
 const Allocator = std.mem.Allocator;
@@ -18,7 +20,7 @@ const Patch = @This();
 const Pointer = lib.Pointer;
 const Writer = std.Io.Writer;
 
-arena: std.heap.ArenaAllocator,
+arena: Arena,
 operations: std.ArrayList(Operation) = .empty,
 
 pub const Operation = union(enum) {
@@ -90,9 +92,20 @@ pub fn deinit(patch: *Patch) void {
 /// Parses a JSON Patch document, reporting anything that RFC 6902 forbids. On
 /// failure, `options.diagnostics` receives the location of the problem.
 pub fn parse(gpa: Allocator, source: []const u8, options: ParseOptions) ParseError!Patch {
-    var patch: Patch = .init(gpa);
+    return parseInto(.init(gpa), source, options);
+}
+
+/// As `parse`, starting out with `buffer` instead of allocating, which is what
+/// `lib.apply` uses, as it knows the patch does not outlive it.
+pub fn parseBuffered(gpa: Allocator, source: []const u8, options: ParseOptions, buffer: []u8) ParseError!Patch {
+    return parseInto(.{ .arena = .initBuffer(gpa, buffer) }, source, options);
+}
+
+inline fn parseInto(empty: Patch, source: []const u8, options: ParseOptions) ParseError!Patch {
+    var patch = empty;
     errdefer patch.deinit();
 
+    const gpa = patch.arena.gpa;
     const arena = patch.arena.allocator();
     const text = switch (options.source) {
         .copy => try arena.dupe(u8, source),
@@ -100,6 +113,7 @@ pub fn parse(gpa: Allocator, source: []const u8, options: ParseOptions) ParseErr
     };
     var parser: Parser = .{
         .arena = arena,
+        .bump = &patch.arena,
         .cursor = .{ .src = text },
         .max_depth = options.max_depth,
     };
@@ -108,12 +122,22 @@ pub fn parse(gpa: Allocator, source: []const u8, options: ParseOptions) ParseErr
     };
     // Operations are rarely shorter than this, so the list seldom has to grow.
     try patch.operations.ensureTotalCapacity(arena, text.len / 64 + 1);
-    try parser.document(&patch.operations);
+    // Text that is known to be valid needs no checking while it is taken apart.
+    if (std.mem.startsWith(u8, text[scan.skipWhitespace(text, 0)..], "[") and
+        try structure.document(gpa, text, options.max_depth, null) != null)
+    {
+        try parser.walk(&patch.operations);
+    } else {
+        try parser.document(&patch.operations);
+    }
     return patch;
 }
 
 const Parser = struct {
     arena: Allocator,
+    /// The same arena as `arena`, for calls that are too frequent to go through
+    /// an allocator.
+    bump: *Arena,
     cursor: Cursor,
     max_depth: u16,
 
@@ -152,6 +176,99 @@ const Parser = struct {
         cursor.skipWhitespace();
         if (cursor.pos != cursor.src.len) return error.SyntaxError;
     }
+
+    /// Reads the operations of a patch that is known to be a valid JSON array.
+    /// Bounds are checked regardless, because it costs little.
+    fn walk(parser: *Parser, operations: *std.ArrayList(Operation)) ParseError!void {
+        const src = parser.cursor.src;
+        var i = skip(src, skip(src, 0) + 1);
+        if (byteAt(src, i) == ']') return;
+        while (true) {
+            const start = i;
+            if (byteAt(src, i) != '{') {
+                parser.cursor.pos = i;
+                return error.NotAnObject;
+            }
+            i = skip(src, i + 1);
+
+            var members: Members = .initFill(.{});
+            if (byteAt(src, i) == '}') {
+                i += 1;
+            } else while (true) {
+                const key_start = i + 1;
+                var which = knownMember(src, key_start);
+                if (which) |known| {
+                    i = key_start + key_lengths.get(known) + 1;
+                } else {
+                    const key = scan.stringEnd(src, key_start) orelse return error.SyntaxError;
+                    which = try parser.classify(src[key_start..key.end], key.escaped);
+                    i = key.end + 1;
+                }
+                i = skip(src, skip(src, i) + 1);
+
+                const value_start = i;
+                var escaped = false;
+                if (byteAt(src, i) == '"') {
+                    const end = scan.stringEnd(src, i + 1) orelse return error.SyntaxError;
+                    escaped = end.escaped;
+                    i = end.end + 1;
+                } else {
+                    i = scan.valueEnd(src, i) orelse return error.SyntaxError;
+                }
+                if (which) |known| {
+                    const slot = members.getPtr(known);
+                    slot.text = src[value_start..i];
+                    slot.escaped = escaped;
+                    slot.count +|= 1;
+                }
+
+                i = skip(src, i);
+                const next = byteAt(src, i);
+                i += 1;
+                if (next == '}') break;
+                i = skip(src, i);
+            }
+
+            parser.cursor.pos = start;
+            const built = try parser.build(&members);
+            if (operations.items.len == operations.capacity) try operations.ensureUnusedCapacity(parser.arena, 1);
+            operations.appendAssumeCapacity(built);
+
+            i = skip(src, i);
+            if (byteAt(src, i) == ']') return;
+            i = skip(src, i + 1);
+        }
+    }
+
+    inline fn skip(src: []const u8, start: usize) usize {
+        if (byteAt(src, start) > ' ') return start;
+        return scan.skipWhitespace(src, start);
+    }
+
+    /// Returns the byte at `i`, or something that no caller is looking for.
+    inline fn byteAt(src: []const u8, i: usize) u8 {
+        return if (i < src.len) src[i] else 0;
+    }
+
+    const key_lengths: std.enums.EnumArray(Member, usize) = .init(.{ .op = 2, .path = 4, .from = 4, .value = 5 });
+
+    /// Recognizes a key without escapes, whose text starts at `start`, by reading
+    /// it as an integer, which is much faster than finding where it ends.
+    inline fn knownMember(src: []const u8, start: usize) ?Member {
+        if (src.len -| start < 6) return null;
+        const word = std.mem.readInt(u32, src[start..][0..4], .little);
+        const fifth = src[start + 4];
+        if (word & 0xff_ffff == word_op) return .op;
+        if (word == word_path and fifth == '"') return .path;
+        if (word == word_value and fifth == 'e' and src[start + 5] == '"') return .value;
+        if (word == word_from and fifth == '"') return .from;
+        return null;
+    }
+
+    const word_op = std.mem.readInt(u24, "op\"", .little);
+    const word_path = std.mem.readInt(u32, "path", .little);
+    const word_value = std.mem.readInt(u32, "valu", .little);
+    const word_from = std.mem.readInt(u32, "from", .little);
 
     fn operation(parser: *Parser) ParseError!Operation {
         const cursor = &parser.cursor;
@@ -266,7 +383,7 @@ const Parser = struct {
     }
 
     fn pointer(parser: *Parser, members: *Members, which: Member) ParseError!Pointer {
-        return Pointer.parse(parser.arena, try parser.stringValue(try member(members, which)));
+        return Pointer.parseWith(parser.bump, try parser.stringValue(try member(members, which)));
     }
 
     fn member(members: *const Members, which: Member) ParseError!Slot {
@@ -431,6 +548,34 @@ test "unknown members are ignored even if they resemble known ones" {
     defer patch.deinit();
     try testing.expectEqualStrings("/a", patch.operations.items[0].move.from.text);
     try testing.expectEqualStrings("/b", patch.operations.items[0].move.path.text);
+}
+
+test "keys that start like known ones are not mistaken for them" {
+    var patch = try parse(testing.allocator,
+        \\[{"opx":"copy","op":"add","opx":"move","op ":1,"o":2,"path":"/a","pathx":"/b","pat":3,
+        \\  "value":1,"valuex":2,"valu":3,"from":"/c","fromx":"/d","fro":4}]
+    , .{});
+    defer patch.deinit();
+    try testing.expectEqualStrings("/a", patch.operations.items[0].add.path.text);
+    try testing.expectEqualStrings("1", patch.operations.items[0].add.value);
+
+    var transfer = try parse(testing.allocator,
+        \\[{"op":"move","from":"/a","fromx":"/b","path":"/c","pathx":"/d"}]
+    , .{});
+    defer transfer.deinit();
+    try testing.expectEqualStrings("/a", transfer.operations.items[0].move.from.text);
+    try testing.expectEqualStrings("/c", transfer.operations.items[0].move.path.text);
+}
+
+test "keys are recognized wherever they are in the text" {
+    // Keys that end close to the end of the text cannot be read as a whole word.
+    var patch = try parse(testing.allocator,
+        \\[{"path":"/a","value":1,"op":"add"},{"value":2,"op":"add","path":"/b"},
+        \\ {"path":"/c","op":"remove"},{"from":"/d","op":"copy","path":"/e"}]
+    , .{});
+    defer patch.deinit();
+    try testing.expectEqual(4, patch.operations.items.len);
+    try testing.expectEqualStrings("/e", patch.operations.items[3].copy.path.text);
 }
 
 test "escapes in keys and values are honored" {

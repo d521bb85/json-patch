@@ -31,7 +31,7 @@ pub const Token = struct {
     /// What the token means when applied to an array.
     index: Index,
 
-    fn init(allocator: Allocator, text: []const u8, escaped: bool) ParseError!Token {
+    inline fn init(allocator: anytype, text: []const u8, escaped: bool) ParseError!Token {
         const name = if (escaped) try unescape(allocator, text) else text;
         return .{ .name = name, .index = .parse(name) };
     }
@@ -46,8 +46,13 @@ pub const Token = struct {
         overflow = std.math.maxInt(usize) - 2,
         _,
 
-        fn parse(name: []const u8) Index {
+        inline fn parse(name: []const u8) Index {
             if (name.len == 0) return .invalid;
+            if (name[0] -% '0' > 9 and name.len != 1) return .invalid;
+            return parseDigits(name);
+        }
+
+        fn parseDigits(name: []const u8) Index {
             if (name.len == 1 and name[0] == '-') return .end;
             if (name[0] == '0' and name.len > 1) return .invalid;
             var index: usize = 0;
@@ -69,9 +74,38 @@ pub const Token = struct {
 /// Parses `text`, allocating with `allocator`. The result refers to `text` and
 /// must not outlive it.
 pub fn parse(allocator: Allocator, text: []const u8) ParseError!Pointer {
+    return parseWith(allocator, text);
+}
+
+/// As `parse`, for anything with the `alloc` method of an allocator.
+pub fn parseWith(allocator: anytype, text: []const u8) ParseError!Pointer {
     if (text.len == 0) return root;
     if (text[0] != '/') return error.InvalidPointer;
+    if (text.len > max_short_len) return parseLong(allocator, text);
 
+    // Recording every position and only advancing at a slash means that a token
+    // ending costs no branch, and the length of a token is impossible to predict.
+    var slashes: [max_short_len + 1]u8 = undefined;
+    var count: usize = 0;
+    var tildes: u8 = 0;
+    for (text, 0..) |c, i| {
+        slashes[count] = @intCast(i);
+        count += @intFromBool(c == '/');
+        tildes |= @intFromBool(c == '~');
+    }
+    slashes[count] = @intCast(text.len);
+
+    const tokens = try allocator.alloc(Token, count);
+    for (tokens, 0..) |*token, i| {
+        token.* = try .init(allocator, text[@as(usize, slashes[i]) + 1 .. slashes[i + 1]], tildes != 0);
+    }
+    return .{ .text = text, .tokens = tokens };
+}
+
+/// The longest pointer that `parse` handles without a pass to count its tokens.
+const max_short_len = 192;
+
+fn parseLong(allocator: anytype, text: []const u8) ParseError!Pointer {
     var count: usize = 0;
     var escaped = false;
     for (text) |c| {
@@ -92,7 +126,7 @@ pub fn parse(allocator: Allocator, text: []const u8) ParseError!Pointer {
     return .{ .text = text, .tokens = tokens };
 }
 
-fn unescape(allocator: Allocator, escaped: []const u8) ParseError![]const u8 {
+fn unescape(allocator: anytype, escaped: []const u8) ParseError![]const u8 {
     const first = std.mem.indexOfScalar(u8, escaped, '~') orelse return escaped;
     const out = try allocator.alloc(u8, escaped.len);
     @memcpy(out[0..first], escaped[0..first]);

@@ -161,7 +161,7 @@ inline fn skipSpace(src: []const u8, start: usize) usize {
     return i;
 }
 
-inline fn literalEnd(src: []const u8, i: usize, text: []const u8) Error!usize {
+pub inline fn literalEnd(src: []const u8, i: usize, text: []const u8) Error!usize {
     if (!std.mem.startsWith(u8, src[i..], text)) return error.SyntaxError;
     return i + text.len;
 }
@@ -246,7 +246,7 @@ fn stringStep(src: []const u8, i: usize) Error!?usize {
     };
 }
 
-fn escapeEnd(src: []const u8, start: usize) Error!usize {
+pub fn escapeEnd(src: []const u8, start: usize) Error!usize {
     if (src.len - start < 2) return error.SyntaxError;
     switch (src[start + 1]) {
         '"', '\\', '/', 'b', 'f', 'n', 'r', 't' => return start + 2,
@@ -279,7 +279,7 @@ fn hex4(src: []const u8, at: usize) Error!u16 {
 /// Text in many languages is nearly all multi-byte, so rather than classify the
 /// lead byte, this tests each shape against four bytes at once. The conditions
 /// are those of Table 3-7 of the Unicode standard.
-fn utf8RunEnd(src: []const u8, start: usize) Error!usize {
+pub fn utf8RunEnd(src: []const u8, start: usize) Error!usize {
     var i = start;
     while (src.len - i >= 4) {
         const word = std.mem.readInt(u32, src[i..][0..4], .little);
@@ -327,7 +327,7 @@ fn utf8End(src: []const u8, start: usize) Error!usize {
     return start + len;
 }
 
-fn numberEnd(src: []const u8, start: usize) Error!usize {
+pub fn numberEnd(src: []const u8, start: usize) Error!usize {
     var at = start;
     if (src[at] == '-') at += 1;
     if (at >= src.len) return error.SyntaxError;

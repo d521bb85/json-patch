@@ -4,8 +4,9 @@ A complete implementation of [JSON Patch (RFC 6902)](https://www.rfc-editor.org/
 and [JSON Pointer (RFC 6901)](https://www.rfc-editor.org/rfc/rfc6901) for Zig, with no dependencies.
 
 Instead of parsing a whole document into a tree, it keeps every value as a slice of the
-original text and looks inside only the containers a patch passes through. Everything else is
-skipped by a bit-parallel scanner and copied to the output untouched.
+original text and looks inside only the containers a patch passes through. Validation checks the
+grammar with bitmasks, 64 bytes at a time, and notes where containers end as it goes, so nothing
+has to be scanned twice. Everything a patch does not touch is copied to the output as it was.
 
 - **Atomic.** A patch that fails leaves the document as it was, with no copy made up front.
 - **Lossless.** Untouched values come out byte for byte, so formatting and number precision survive.
@@ -109,7 +110,8 @@ These trade convenience for speed where the caller can guarantee something:
 | `Document.ApplyOptions.values = .borrow` | Values are not copied into the document | The `Patch` outlives the `Document` |
 
 Memory for values replaced by a patch is held until `deinit`. A long-lived document can call
-`compact` to release it.
+`compact` to release it. A document also keeps an index of its containers, which takes 12 bytes
+for each one that is at least 32 bytes long, and is dropped if it would outgrow the document.
 
 ## Behavior where the RFCs leave room
 
@@ -144,43 +146,56 @@ zig build test
   including those it marks as disabled, run in each ownership and validation mode.
 - **Differential:** random documents and patches are checked against a naive reference
   implementation that shares no code with the library, including that failed patches change nothing.
+- **Validation:** the fast validator is checked against the strict one on random JSON and on
+  corrupted copies of it, at every position within a block. It may decline to judge anything, but
+  it must never accept text that the strict one rejects.
 - **Fuzzing:** `zig build test --fuzz` feeds arbitrary bytes to the parsers.
 
 ## Performance
 
+These numbers were measured on Apple Silicon: an Apple M5 with 4 performance cores, 6 efficiency
+cores, and 32 GB of memory, running macOS 27. That matters more than it usually would, because the
+fastest code here is written for ARM's NEON instructions, and how much it gains depends on the
+CPU. Other CPUs run portable vector code instead, and x86 has not been measured.
+
 Each number below is the full path from JSON text to JSON text: parse the document, parse the
-patch, apply it, and write the result. Times are medians on an Apple M5, with every library built
-for speed (`ReleaseFast`, `-O3 -flto`, or `--release` with LTO), and each result is checked against
-the expected output, so an incorrect result cannot appear as a fast one.
+patch, apply it, and write the result. Times are the median of three rounds of at least two seconds
+each, with every library built for speed (`ReleaseFast`, `-O3 -flto`, or `--release` with LTO), and
+each result is checked against the expected output, so an incorrect result cannot appear as a fast
+one.
 
 | Workload | Document | Ops | This library | This library, trusted | [yyjson](https://github.com/ibireme/yyjson) | Rust `json-patch` | Node `fast-json-patch` | Go `evanphx/json-patch` |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `small` | 544 B | 4 | 0.8 µs | **0.6 µs** | 0.8 µs | 2.5 µs | 4.2 µs | 12.7 µs |
-| `medium` | 84 KB | 8 | 58 µs | **22 µs** | 64 µs | 227 µs | 203 µs | 846 µs |
-| `twitter` | 467 KB | 8 | 260 µs | **103 µs** | 263 µs | 930 µs | 1.15 ms | 4.9 ms |
-| `citm_catalog` | 500 KB | 8 | 379 µs | **144 µs** | 382 µs | 1.48 ms | 3.05 ms | 5.4 ms |
-| `pretty` | 2.7 MB | 8 | 1.61 ms | **0.61 ms** | 1.63 ms | 4.9 ms | 10.6 ms | 26.1 ms |
-| `large` | 17 MB | 8 | 12.1 ms | **4.8 ms** | 19.1 ms | 48.2 ms | 101 ms | 173 ms |
-| `keyed` | 17 MB | 8 | 13.1 ms | **5.4 ms** | 22.4 ms | 54.7 ms | 115 ms | 188 ms |
-| `many_ops` | 84 KB | 1000 | 211 µs | 175 µs | 176 µs | 589 µs | 10 ms | rejected |
+| `small` | 544 B | 4 | 0.71 µs | **0.62 µs** | 0.79 µs | 2.6 µs | 4.1 µs | 13 µs |
+| `medium` | 84 KB | 8 | 16 µs | **8.4 µs** | 64 µs | 228 µs | 202 µs | 913 µs |
+| `twitter` | 467 KB | 8 | 86 µs | **35 µs** | 264 µs | 947 µs | 1.16 ms | 5.0 ms |
+| `citm_catalog` | 500 KB | 8 | 148 µs | **72 µs** | 384 µs | 1.48 ms | 3.05 ms | 5.4 ms |
+| `pretty` | 2.7 MB | 8 | 528 µs | **231 µs** | 1.63 ms | 4.9 ms | 10.4 ms | 27.1 ms |
+| `large` | 17 MB | 8 | 3.5 ms | **1.75 ms** | 18.6 ms | 48.0 ms | 98.9 ms | 185 ms |
+| `keyed` | 17 MB | 8 | 3.7 ms | **1.91 ms** | 21.4 ms | 54.7 ms | 109 ms | 199 ms |
+| `many_ops` | 84 KB | 1000 | 117 µs | **109 µs** | 176 µs | 594 µs | 10.1 ms | rejected |
 
 - **Trusted** sets `.validation = .none`, for documents already known to be valid, such as those a
   database stored earlier. The other libraries validate their input, so this column is not a
   like-for-like comparison with them.
-- **The default mode** is a like-for-like comparison. Against yyjson, the closest competitor, it
-  is within 2% on `small`, `twitter`, `citm_catalog`, and `pretty`, about 10% faster on `medium`,
-  37-41% faster on `large` and `keyed`, and about 20% slower on `many_ops`. That workload is the worst
-  case for lazy expansion, because a patch that touches much of a document gets little from
-  skipping the rest. In trusted mode, `many_ops` is a tie with yyjson within measurement noise.
+- **The default mode** is a like-for-like comparison, and it is the fastest on all of these
+  workloads. Against yyjson, the closest competitor, it is about 10% faster on `small`, 1.5 times
+  faster on `many_ops`, 2.6 to 4 times faster on `citm_catalog`, `twitter`, `pretty`, and `medium`,
+  and more than 5 times faster on `large` and `keyed`. The two smallest leads have the same
+  explanation: a small document leaves little to skip, and so does a patch that touches much of a
+  document.
 - **"Rejected"** means that library refused a valid patch. `evanphx/json-patch` 5.9.11 fails a `test`
   on an object after one of its members has been `replace`d with `null`.
+- **Memory** comes from the system `malloc` for this library, yyjson, and Rust. Node and Go have
+  their own allocators.
 - These are the versions tested: yyjson 0.12.0, Rust `json-patch` 4.2.0 with `serde_json` 1.0.154,
   Node `fast-json-patch` 3.1.1 on Node 24, and Go 1.27 with `evanphx/json-patch` 5.9.11.
-- Results are from one ARM machine, and only this workload set. x86 has not been measured.
+- Results are from this one machine, and only this workload set.
 
-Time still grows with document size, because validation reads every byte and expanding a container
-has to scan it to find where each child ends. Skipping runs at about 12 GB/s and validation at
-about 2.3 GB/s on this machine.
+Time still grows with document size, because validation reads every byte, at about 3.7 to 6.6 GB/s
+on this machine, and the result has to be written. Applying a patch hardly does: validation also
+notes where containers end, so expanding one does not have to scan its children. A document that
+skipped validation builds the same record in a single pass, the first time a patch reaches into it.
 
 To reproduce these numbers, build the other implementations with `bench/build.sh`, which needs a
 copy of the yyjson source plus cargo, go, and npm, then:

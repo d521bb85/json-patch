@@ -25,7 +25,9 @@ const Mode = enum {
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const io = init.io;
-    const gpa = std.heap.smp_allocator;
+    // The allocator that the programs in `compare/` use, so that all of them pay
+    // the same for memory.
+    const gpa = std.heap.c_allocator;
     const args = try init.minimal.args.toSlice(arena);
     const dir_path = args[1];
     const min_ns = try std.fmt.parseInt(u64, args[2], 10) * std.time.ns_per_ms;
